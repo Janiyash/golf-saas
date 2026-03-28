@@ -84,7 +84,7 @@ app/
  │   │   └── page.tsx
  │   ├── pricing/
  │   │   └── page.tsx
-     |   └──    PricingPageContent.tsx
+     |   └── PricingPageContent.tsx
  │   └── charities/
  │       ├── page.tsx
  │       └── [id]/
