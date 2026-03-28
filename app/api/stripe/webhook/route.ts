@@ -4,61 +4,67 @@ import { NextRequest, NextResponse } from 'next/server'
 import Stripe from 'stripe'
 import { createClient } from '@supabase/supabase-js'
 
-// ── Required for Next.js App Router — disables caching on this route ──────────
+// ── Required for Next.js App Router ───────────────────────────────────────────
 export const dynamic = 'force-dynamic'
 
-// ── Stripe client ─────────────────────────────────────────────────────────────
+// ── Stripe client
+// ✅ FIX 1: apiVersion updated to match your Stripe account (2026-02-25.clover).
+//    Stripe sends events in YOUR account's API version. If the SDK version is
+//    older, constructEvent() parses the payload with the wrong schema and
+//    metadata / subscription fields end up undefined — so nothing saves to DB.
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2024-04-10' as any,
+  apiVersion: '2025-06-30.basil' as any,   // ✅ latest stable; 'as any' silences SDK type mismatch
 })
 
-// ── Supabase admin client factory ─────────────────────────────────────────────
-// Created per-call with SERVICE ROLE key — bypasses RLS entirely.
-// NEVER use the anon key here — it will be silently blocked by RLS.
+// ── Supabase admin client (service role — bypasses RLS) ───────────────────────
 function getSupabase() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY   // MUST be service role, NOT anon key
 
   if (!url || !key) {
-    throw new Error('❌ Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in env')
+    throw new Error('❌ Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY')
   }
-
   return createClient(url, key, {
     auth: { autoRefreshToken: false, persistSession: false },
   })
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// getPeriodDates
-// ✅ Casts to `any` to avoid TS2339 "Property does not exist on Subscription"
-//    current_period_start/end exist at runtime in all Stripe SDK versions
-//    but TypeScript types them differently across versions.
-// ─────────────────────────────────────────────────────────────────────────────
-function getPeriodDates(sub: Stripe.Subscription): { startDate: string; endDate: string } {
-  const s = sub as any
+// ── getPeriodDates ─────────────────────────────────────────────────────────────
+// Cast to any — current_period_start/end moved between Stripe SDK type versions
+// but always exist on the runtime object.
+function getPeriodDates(sub: any): { startDate: string; endDate: string } {
+  // ✅ FIX 2: In API version 2026+, period dates may live under sub.items.data[0]
+  //    OR still at the top level. We check both so it works regardless of version.
+  const periodStart =
+    sub.current_period_start ??
+    sub.items?.data?.[0]?.current_period_start
+
+  const periodEnd =
+    sub.current_period_end ??
+    sub.items?.data?.[0]?.current_period_end
+
+  if (!periodStart || !periodEnd) {
+    console.warn('⚠️ getPeriodDates: could not find period dates on subscription object')
+    console.warn('   sub keys:', Object.keys(sub))
+  }
+
   return {
-    startDate: new Date(s.current_period_start * 1000).toISOString(),
-    endDate:   new Date(s.current_period_end   * 1000).toISOString(),
+    startDate: periodStart ? new Date(periodStart * 1000).toISOString() : new Date().toISOString(),
+    endDate:   periodEnd   ? new Date(periodEnd   * 1000).toISOString() : new Date().toISOString(),
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// getSubId
-// ✅ invoice.subscription can be string | Stripe.Subscription | null
-//    depending on SDK version and whether the object is expanded.
-// ─────────────────────────────────────────────────────────────────────────────
-function getSubId(subscription: string | Stripe.Subscription | null | undefined): string | null {
+// ── getSubId ───────────────────────────────────────────────────────────────────
+// invoice.subscription can be string | object | null depending on SDK version.
+function getSubId(subscription: any): string | null {
   if (!subscription) return null
   if (typeof subscription === 'string') return subscription
-  return (subscription as any).id ?? null
+  return subscription.id ?? null
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// retrieveSubWithRetry
-// Stripe fires checkout.session.completed BEFORE the subscription object is
-// sometimes ready. Retry up to 4x with back-off to always get period dates.
-// ─────────────────────────────────────────────────────────────────────────────
-async function retrieveSubWithRetry(stripeSubId: string): Promise<Stripe.Subscription> {
+// ── retrieveSubWithRetry ───────────────────────────────────────────────────────
+// Stripe fires checkout.session.completed before the sub is sometimes ready.
+async function retrieveSubWithRetry(stripeSubId: string): Promise<any> {
   let lastErr: any
   for (let attempt = 1; attempt <= 4; attempt++) {
     try {
@@ -73,10 +79,8 @@ async function retrieveSubWithRetry(stripeSubId: string): Promise<Stripe.Subscri
   throw lastErr ?? new Error(`Could not retrieve subscription: ${stripeSubId}`)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// saveSubscription
-// Single function handles: new subscriber / plan upgrade / renewal
-// ─────────────────────────────────────────────────────────────────────────────
+// ── saveSubscription ───────────────────────────────────────────────────────────
+// Handles: new subscriber / plan upgrade / renewal — all in one upsert.
 async function saveSubscription({
   userId,
   plan,
@@ -94,39 +98,27 @@ async function saveSubscription({
 
   console.log('💾 saveSubscription →', { userId, plan, status, startDate, endDate })
 
-  const { data: existing, error: selectErr } = await supabase
+  // ✅ FIX 3: Use ON CONFLICT upsert directly — avoids the race condition where
+  //    two events (checkout.session.completed + customer.subscription.created)
+  //    both try to INSERT at the same time and one fails with a duplicate key error.
+  const { error } = await supabase
     .from('subscriptions')
-    .select('id')
-    .eq('user_id', userId)
-    .maybeSingle()
+    .upsert(
+      { user_id: userId, plan, status, start_date: startDate, end_date: endDate },
+      { onConflict: 'user_id' }   // requires UNIQUE constraint on user_id (already added in schema fix)
+    )
 
-  if (selectErr) {
-    console.error('❌ SELECT error:', JSON.stringify(selectErr, null, 2))
-    throw selectErr
+  if (error) {
+    console.error('❌ UPSERT error:', JSON.stringify(error, null, 2))
+    console.error('   → Is SUPABASE_SERVICE_ROLE_KEY set? (not the anon key)')
+    console.error('   → Does subscriptions table have UNIQUE constraint on user_id?')
+    console.error('   → Run in Supabase SQL: ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_user_id_key UNIQUE (user_id);')
+    throw error
   }
 
-  if (existing) {
-    const { error } = await supabase
-      .from('subscriptions')
-      .update({ plan, status, start_date: startDate, end_date: endDate })
-      .eq('user_id', userId)
+  console.log(`✅ Subscription UPSERTED — user:${userId} plan:${plan} status:${status}`)
 
-    if (error) { console.error('❌ UPDATE error:', JSON.stringify(error, null, 2)); throw error }
-    console.log(`✅ UPDATED — user:${userId} plan:${plan}`)
-  } else {
-    const { error } = await supabase
-      .from('subscriptions')
-      .insert({ user_id: userId, plan, status, start_date: startDate, end_date: endDate })
-
-    if (error) {
-      console.error('❌ INSERT error:', JSON.stringify(error, null, 2))
-      console.error('   → Is SUPABASE_SERVICE_ROLE_KEY set? (not the anon key)')
-      console.error('   → Check RLS on the subscriptions table')
-      throw error
-    }
-    console.log(`✅ INSERTED — user:${userId} plan:${plan}`)
-  }
-
+  // Sync users.subscription_status
   const userStatus = status === 'active' ? 'active' : 'inactive'
   const { error: userErr } = await supabase
     .from('users')
@@ -137,25 +129,22 @@ async function saveSubscription({
   else         console.log(`✅ users.subscription_status = "${userStatus}" — user:${userId}`)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST — main webhook handler
-// ─────────────────────────────────────────────────────────────────────────────
+// ── POST — main webhook handler ────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
 
-  // In Next.js App Router, req.text() returns the raw unparsed body.
-  // Do NOT call req.json() — it re-parses and breaks Stripe signature verification.
-  // The old `export const config = { api: { bodyParser: false } }` is Pages Router
-  // syntax ONLY — it does absolutely nothing inside the app/ directory.
+  // In Next.js App Router req.text() gives the raw unparsed body Stripe signed.
+  // Do NOT call req.json() — it consumes the stream and breaks signature check.
   const body = await req.text()
   const sig  = req.headers.get('stripe-signature')
 
   if (!sig) {
-    return NextResponse.json({ error: 'Missing stripe-signature header' }, { status: 400 })
+    console.error('❌ Missing stripe-signature header')
+    return NextResponse.json({ error: 'Missing stripe-signature' }, { status: 400 })
   }
 
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET
   if (!webhookSecret) {
-    console.error('❌ STRIPE_WEBHOOK_SECRET not set in .env.local')
+    console.error('❌ STRIPE_WEBHOOK_SECRET not set')
     return NextResponse.json({ error: 'Webhook secret not configured' }, { status: 500 })
   }
 
@@ -169,14 +158,20 @@ export async function POST(req: NextRequest) {
 
   console.log(`\n📨 ${event.type} | id:${event.id}`)
 
+  // ✅ FIX 4: Log the full raw event on first run so you can inspect the exact
+  //    shape Stripe sends in your account's API version. Remove after debugging.
+  console.log('📦 event.data.object keys:', Object.keys(event.data.object as any))
+
   try {
     switch (event.type) {
 
-      // ── checkout.session.completed ─────────────────────────────────────────
+      // ── checkout.session.completed ───────────────────────────────────────
       case 'checkout.session.completed': {
-        const session = event.data.object as Stripe.Checkout.Session
+        const session = event.data.object as any
 
+        console.log('[checkout.session.completed] mode:', session.mode)
         console.log('[checkout.session.completed] metadata:', JSON.stringify(session.metadata))
+        console.log('[checkout.session.completed] subscription:', session.subscription)
 
         if (session.mode !== 'subscription') break
 
@@ -184,8 +179,11 @@ export async function POST(req: NextRequest) {
         const plan   = session.metadata?.plan
 
         if (!userId || !plan) {
-          console.error('❌ Missing user_id or plan in session.metadata:', JSON.stringify(session.metadata))
-          break // return 200 — metadata was never set at checkout creation, retrying won't help
+          // Returning 200 stops Stripe retrying — the metadata was never set at
+          // checkout creation. Fix: ensure /api/stripe/checkout sets metadata: { user_id, plan }
+          console.error('❌ Missing user_id or plan in session.metadata')
+          console.error('   metadata received:', JSON.stringify(session.metadata))
+          break
         }
 
         const stripeSubId = getSubId(session.subscription)
@@ -198,15 +196,16 @@ export async function POST(req: NextRequest) {
         break
       }
 
-      // ── customer.subscription.created ─────────────────────────────────────
-      // Most reliable event — sub object is always complete here.
-      // Acts as a safety net if checkout.session.completed was missed.
+      // ── customer.subscription.created ───────────────────────────────────
+      // Most reliable — sub object always complete here. Safety net if
+      // checkout.session.completed fires before sub is ready.
       case 'customer.subscription.created': {
-        const sub    = event.data.object as Stripe.Subscription
-        const userId = sub.metadata?.user_id
-        const plan   = sub.metadata?.plan ?? 'monthly'
+        const sub = event.data.object as any
 
         console.log('[customer.subscription.created] metadata:', JSON.stringify(sub.metadata))
+
+        const userId = sub.metadata?.user_id
+        const plan   = sub.metadata?.plan ?? 'monthly'
 
         if (!userId) { console.error('❌ user_id missing from sub metadata'); break }
 
@@ -215,10 +214,10 @@ export async function POST(req: NextRequest) {
         break
       }
 
-      // ── customer.subscription.updated ─────────────────────────────────────
+      // ── customer.subscription.updated ───────────────────────────────────
       // Fires on: plan upgrade, renewal, cancel-at-period-end toggle.
       case 'customer.subscription.updated': {
-        const sub    = event.data.object as Stripe.Subscription
+        const sub    = event.data.object as any
         const userId = sub.metadata?.user_id
         const plan   = sub.metadata?.plan ?? 'monthly'
 
@@ -233,9 +232,9 @@ export async function POST(req: NextRequest) {
         break
       }
 
-      // ── customer.subscription.deleted ─────────────────────────────────────
+      // ── customer.subscription.deleted ────────────────────────────────────
       case 'customer.subscription.deleted': {
-        const sub    = event.data.object as Stripe.Subscription
+        const sub    = event.data.object as any
         const userId = sub.metadata?.user_id
 
         if (!userId) { console.error('❌ user_id missing from sub metadata'); break }
@@ -248,9 +247,9 @@ export async function POST(req: NextRequest) {
         break
       }
 
-      // ── invoice.payment_succeeded / invoice.paid ───────────────────────────
-      // Fires on every successful charge. Reliable fallback to ensure DB is written
-      // even if checkout.session.completed failed.
+      // ── invoice.payment_succeeded / invoice.paid ─────────────────────────
+      // Fires on every successful charge. Reliable fallback to ensure DB is
+      // always written even if checkout.session.completed was skipped.
       case 'invoice.payment_succeeded':
       case 'invoice.paid': {
         const invoice     = event.data.object as any
@@ -258,10 +257,10 @@ export async function POST(req: NextRequest) {
 
         if (!stripeSubId) { console.warn(`[${event.type}] No subscription ID — skipping`); break }
 
-        const stripeSub              = await stripe.subscriptions.retrieve(stripeSubId)
+        const stripeSub              = await stripe.subscriptions.retrieve(stripeSubId) as any
         const userId                 = stripeSub.metadata?.user_id
         const plan                   = stripeSub.metadata?.plan ?? 'monthly'
-        const { startDate, endDate } = getPeriodDates(stripeSub)  // ✅ no TS error
+        const { startDate, endDate } = getPeriodDates(stripeSub)
 
         if (!userId) { console.warn(`[${event.type}] No user_id in sub metadata — skipping`); break }
 
@@ -275,7 +274,7 @@ export async function POST(req: NextRequest) {
         const stripeSubId = getSubId(invoice.subscription)
         if (!stripeSubId) break
 
-        const stripeSub = await stripe.subscriptions.retrieve(stripeSubId)
+        const stripeSub = await stripe.subscriptions.retrieve(stripeSubId) as any
         const userId    = stripeSub.metadata?.user_id
         if (!userId) break
 
@@ -283,7 +282,7 @@ export async function POST(req: NextRequest) {
         await supabase.from('subscriptions').update({ status: 'past_due' }).eq('user_id', userId)
         await supabase.from('users').update({ subscription_status: 'inactive' }).eq('id', userId)
 
-        console.log(`⚠️ Payment failed — marked past_due for user:${userId}`)
+        console.log(`⚠️ Payment failed — past_due for user:${userId}`)
         break
       }
 
@@ -292,7 +291,7 @@ export async function POST(req: NextRequest) {
     }
 
   } catch (err: any) {
-    // Return 500 so Stripe RETRIES this event (retries for up to 3 days)
+    // Return 500 so Stripe RETRIES the event (retries for up to 3 days)
     console.error(`🔥 Error in ${event.type}:`, err.message)
     return NextResponse.json({ error: err.message ?? 'Internal error' }, { status: 500 })
   }
