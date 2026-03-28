@@ -273,7 +273,7 @@ Recommended:
 
 ## 👨‍💻 Author
 
-Built with ❤️ by **Your Name**
+Built with ❤️ by **Yash**
 
 ---
 
