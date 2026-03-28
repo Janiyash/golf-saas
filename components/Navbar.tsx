@@ -14,41 +14,47 @@ export default function NavBar() {
   const [dropOpen, setDropOpen] = useState<boolean>(false)
   const dropRef = useRef<HTMLDivElement>(null)
 
-  useEffect(() => {
-    const onScroll = () => setScrolled(window.scrollY > 20)
-    window.addEventListener('scroll', onScroll)
+useEffect(() => {
+  const onScroll = () => setScrolled(window.scrollY > 20)
+  window.addEventListener('scroll', onScroll)
 
-    const init = async () => {
-      const { data } = await supabase.auth.getUser()
-      const u = data?.user
-      if (!u) return
-      setUser(u)
+  const init = async () => {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession()
 
-      const { data: profile } = await supabase
-        .from('users')
-        .select('role, avatar_url')
-        .eq('id', u.id)
-        .single()
+    if (!session?.user) return
 
-      if (profile) {
-        setIsAdmin(profile.role === 'admin')
-        setAvatarUrl(profile.avatar_url ?? null)
-      }
+    const user = session.user
+    setUser(user)
+
+    const { data: profile, error } = await supabase
+      .from('users')
+      .select('role, avatar_url')
+      .eq('id', user.id)
+      .single()
+
+    if (!error && profile) {
+      setIsAdmin(profile.role === 'admin')
+      setAvatarUrl(profile.avatar_url ?? null)
     }
-    init()
+  }
 
-    const handleOutside = (e: MouseEvent) => {
-      if (dropRef.current && !dropRef.current.contains(e.target as Node)) {
-        setDropOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', handleOutside)
+  init()
 
-    return () => {
-      window.removeEventListener('scroll', onScroll)
-      document.removeEventListener('mousedown', handleOutside)
+  const handleOutside = (e: MouseEvent) => {
+    if (dropRef.current && !dropRef.current.contains(e.target as Node)) {
+      setDropOpen(false)
     }
-  }, [])
+  }
+
+  document.addEventListener('mousedown', handleOutside)
+
+  return () => {
+    window.removeEventListener('scroll', onScroll)
+    document.removeEventListener('mousedown', handleOutside)
+  }
+}, [])
 
   const handleLogout = async () => {
     await supabase.auth.signOut()
