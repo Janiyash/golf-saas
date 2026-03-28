@@ -1,6 +1,6 @@
 'use client'
 import { useEffect, useRef, useState } from 'react'
-import { useRouter, useSearchParams } from 'next/navigation'
+import { useRouter } from 'next/navigation'
 import NavBar from '@/components/Navbar'
 import Sidebar from '@/components/Sidebar'
 import { supabase } from '@/lib/supabase'
@@ -8,7 +8,6 @@ import { formatDate, formatMonthYear } from '@/utils/helpers'
 
 export default function Subscription() {
   const router       = useRouter()
-  const searchParams = useSearchParams()
 
   const [isLoaded,        setIsLoaded]        = useState(false)
   const [sub,             setSub]             = useState<any>(null)
@@ -23,59 +22,7 @@ export default function Subscription() {
   const cursorRef    = useRef<HTMLDivElement>(null)
   const cursorDotRef = useRef<HTMLDivElement>(null)
 
-  // ── Handle Stripe redirect back ────────────────────────────────────────────
-  useEffect(() => {
-    if (searchParams.get('success') === 'true') {
-      setToast({ msg: '🎉 Payment successful! Activating your subscription...', type: 'success' })
-      setPolling(true)
-    }
-    if (searchParams.get('cancelled') === 'true') {
-      setToast({ msg: 'Payment cancelled. You can try again anytime.', type: 'error' })
-    }
-  }, [searchParams])
-
-  // ── Poll DB after payment until webhook writes the subscription ────────────
-  // Stripe webhooks can take 5–15s. We poll every 2s for up to 20s so the
-  // page shows the subscription the moment it appears in the DB.
-  useEffect(() => {
-    if (!polling || !userId) return
-
-    let attempts = 0
-    const MAX = 10 // 10 × 2s = 20s max wait
-
-    const interval = setInterval(async () => {
-      attempts++
-      // ✅ Only select columns that exist in schema: id, user_id, plan, status, start_date, end_date
-      const { data: subData } = await supabase
-        .from('subscriptions')
-        .select('id, user_id, plan, status, start_date, end_date')
-        .eq('user_id', userId)
-        .eq('status', 'active')
-        .order('start_date', { ascending: false })
-        .limit(1)
-        .maybeSingle()
-
-      if (subData) {
-        setSub(subData)
-        setSubLoading(false)
-        setPolling(false)
-        clearInterval(interval)
-        window.history.replaceState({}, '', '/dashboard/subscription')
-        setToast({ msg: '✅ Subscription is now active!', type: 'success' })
-      } else if (attempts >= MAX) {
-        setPolling(false)
-        clearInterval(interval)
-        setToast({
-          msg: 'Subscription may take a moment to appear. Please refresh in 30 seconds if it does not show.',
-          type: 'error',
-        })
-      }
-    }, 2000)
-
-    return () => clearInterval(interval)
-  }, [polling, userId])
-
-  // ── Initial load ───────────────────────────────────────────────────────────
+  // ── Initial load — MUST run first to set userId before polling can work ───
   useEffect(() => {
     setIsLoaded(true)
     const h = (e: MouseEvent) => {
@@ -90,7 +37,6 @@ export default function Subscription() {
 
       setUserEmail(user.email ?? '')
 
-      // ✅ Schema: users(id, name, email, role, subscription_status, charity_id, charity_percentage)
       const { data: appUser } = await supabase
         .from('users')
         .select('id, name, subscription_status')
@@ -102,8 +48,6 @@ export default function Subscription() {
         setUserName(appUser.name || user.email?.split('@')[0] || 'Member')
       }
 
-      // ✅ Schema: subscriptions(id, user_id, plan, status, start_date, end_date)
-      //    No stripe_sub_id, stripe_customer_id or updated_at columns
       const { data: subData } = await supabase
         .from('subscriptions')
         .select('id, user_id, plan, status, start_date, end_date')
@@ -115,13 +59,74 @@ export default function Subscription() {
 
       setSub(subData)
       setSubLoading(false)
+
+      // ✅ Clean the URL immediately so ?success=true never shows in the address bar
+      //    Then just show a toast — no redirect, no page change.
+      if (window.location.search.includes('success=true')) {
+        window.history.replaceState({}, '', '/dashboard/subscription')
+        if (!subData) {
+          setToast({ msg: '🎉 Payment successful! Activating your subscription...', type: 'success' })
+          setPolling(true)
+        } else {
+          setToast({ msg: '✅ Payment successful! Your subscription is now active.', type: 'success' })
+        }
+      }
+
+      if (window.location.search.includes('cancelled=true')) {
+        window.history.replaceState({}, '', '/dashboard/subscription')
+        setToast({ msg: 'Payment cancelled. You can try again anytime.', type: 'error' })
+      }
     }
 
     load()
     return () => window.removeEventListener('mousemove', h)
   }, [])
 
-  // ── Checkout — uses appUser.id (custom users table UUID) ──────────────────
+  // ── Poll DB after payment until webhook writes the subscription ────────────
+  // ✅ FIX 2: Now polling only starts AFTER userId is set (inside load() above)
+  //    so userId is guaranteed to be non-empty when this effect runs.
+  useEffect(() => {
+    if (!polling || !userId) return
+
+    let attempts = 0
+    const MAX = 15 // 15 × 2s = 30s max wait (webhooks can be slow on cold start)
+
+    const interval = setInterval(async () => {
+      attempts++
+      console.log(`🔄 Polling attempt ${attempts}/${MAX} for userId: ${userId}`)
+
+      const { data: subData, error } = await supabase
+        .from('subscriptions')
+        .select('id, user_id, plan, status, start_date, end_date')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .order('start_date', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
+      if (error) console.error('❌ Poll query error:', error)
+
+      if (subData) {
+        setSub(subData)
+        setSubLoading(false)
+        setPolling(false)
+        clearInterval(interval)
+        window.history.replaceState({}, '', '/dashboard/subscription')
+        setToast({ msg: '✅ Subscription is now active!', type: 'success' })
+      } else if (attempts >= MAX) {
+        setPolling(false)
+        clearInterval(interval)
+        setToast({
+          msg: 'Subscription may take a moment to appear. Please refresh in 30 seconds.',
+          type: 'error',
+        })
+      }
+    }, 2000)
+
+    return () => clearInterval(interval)
+  }, [polling, userId])
+
+  // ── Checkout ───────────────────────────────────────────────────────────────
   const handleCheckout = async (type: 'monthly' | 'yearly') => {
     if (!userId) {
       setToast({ msg: 'Session expired. Please log in again.', type: 'error' })
@@ -150,8 +155,7 @@ export default function Subscription() {
     }
   }
 
-  // ── Cancel — marks cancelled in DB via cancel API route ───────────────────
-  // NOTE: no stripe_sub_id in schema, so cancel route uses userId to find sub
+  // ── Cancel ─────────────────────────────────────────────────────────────────
   const handleCancel = async () => {
     if (!userId) return
     if (!confirm('Are you sure you want to cancel? Access continues until the end of your billing period.')) return
@@ -214,19 +218,13 @@ export default function Subscription() {
         @keyframes slideDown { from{opacity:0;transform:translateY(-16px)} to{opacity:1;transform:translateY(0)} }
         @keyframes spin { to{transform:rotate(360deg)} }
         @keyframes polling { to { left:100%; } }
-
-        /* TOAST */
         .toast { position:fixed; top:80px; right:32px; z-index:9000; padding:14px 20px; font-size:.85rem; display:flex; align-items:center; gap:10px; animation:slideDown .25s ease; max-width:440px; box-shadow:0 8px 40px rgba(0,0,0,.5); }
         .toast.success { background:rgba(29,74,46,.97); border:1px solid rgba(61,186,110,.3); color:#6EE7A0; }
         .toast.error   { background:rgba(60,10,10,.97);  border:1px solid rgba(239,68,68,.3);  color:#FCA5A5; }
         .toast-close { margin-left:auto; background:none; border:none; color:inherit; cursor:pointer; font-size:16px; opacity:.7; padding:0 0 0 8px; }
         .toast-close:hover { opacity:1; }
-
-        /* POLLING BAR */
         .polling-bar { height:2px; background:rgba(201,168,76,.12); position:relative; overflow:hidden; margin-bottom:20px; border-radius:2px; }
         .polling-bar-fill { position:absolute; top:0; left:-40%; width:40%; height:100%; background:linear-gradient(90deg,transparent,var(--gold),transparent); animation:polling 1.4s linear infinite; }
-
-        /* ACTIVE PLAN CARD */
         .plan-card { background:var(--dark2); border:1px solid var(--border); padding:32px; margin-bottom:20px; position:relative; }
         .plan-card::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--gold),transparent); }
         .plan-badge { display:inline-flex; align-items:center; gap:8px; border:1px solid rgba(201,168,76,.3); padding:4px 12px; font-size:.7rem; letter-spacing:.12em; text-transform:uppercase; color:var(--gold); margin-bottom:20px; }
@@ -252,8 +250,6 @@ export default function Subscription() {
         .btn-primary { background:linear-gradient(135deg,var(--gold),#E8C060); color:var(--dark); border:none; padding:12px 28px; font-family:'DM Sans',sans-serif; font-size:.85rem; font-weight:500; letter-spacing:.08em; text-transform:uppercase; cursor:pointer; transition:transform .2s,box-shadow .3s; display:inline-flex; align-items:center; gap:8px; }
         .btn-primary:hover:not(:disabled) { transform:translateY(-1px); box-shadow:0 8px 30px rgba(201,168,76,.25); }
         .btn-primary:disabled { opacity:.6; cursor:not-allowed; }
-
-        /* NO SUB STATE */
         .no-sub-banner { background:var(--dark2); border:1px solid rgba(201,168,76,.12); padding:40px 36px; margin-bottom:28px; position:relative; overflow:hidden; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:24px; }
         .no-sub-banner::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,rgba(239,68,68,.6),transparent); }
         .no-sub-banner::after { content:''; position:absolute; inset:0; background:radial-gradient(ellipse 60% 80% at 10% 50%,rgba(239,68,68,.04),transparent); pointer-events:none; }
@@ -320,21 +316,18 @@ export default function Subscription() {
 
           <div className="content">
 
-            {/* Polling progress bar — animates while waiting for webhook */}
             {polling && (
               <div className="polling-bar">
                 <div className="polling-bar-fill" />
               </div>
             )}
 
-            {/* LOADING */}
-            {subLoading && !polling && (
+            {subLoading && (
               <div style={{ color: 'var(--text-muted)', fontSize: '.9rem', padding: '40px 0', textAlign: 'center' }}>
                 Loading subscription details...
               </div>
             )}
 
-            {/* NO SUBSCRIPTION */}
             {!subLoading && !sub && !polling && (
               <>
                 <div className="no-sub-banner">
@@ -392,7 +385,6 @@ export default function Subscription() {
               </>
             )}
 
-            {/* ACTIVE SUBSCRIPTION */}
             {!subLoading && sub && (
               <>
                 <div className="plan-card">
@@ -415,7 +407,6 @@ export default function Subscription() {
                 </div>
 
                 <div className="renewal-info">
-                  {/* ✅ Uses only schema columns: start_date, end_date */}
                   <div><div className="renewal-label">Next Renewal</div><div className="renewal-date">{formatDate(sub?.end_date)}</div></div>
                   <div><div className="renewal-label">Payment Method</div><div className="renewal-date">Card on file</div></div>
                   <div><div className="renewal-label">Member Since</div><div className="renewal-date">{formatMonthYear(sub?.start_date)}</div></div>
